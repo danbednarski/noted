@@ -1,0 +1,33 @@
+[package]
+name = "noted"
+version = "0.1.0"
+edition = "2021"
+description = "A minimal, themable Markdown notes app."
+authors = ["Dan Bednarski <dan.j.bednarski@gmail.com>"]
+license = "MIT"
+repository = "https://github.com/danbednarski/noted"
+
+[dependencies]
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = "0.31"
+dirs = "6"
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+muda = "0.19"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+
+[package.metadata.bundle]
+name = "Noted"
+identifier = "com.bednarski.noted"
+icon = ["assets/icon.icns"]
+category = "public.app-category.productivity"
+short_description = "A minimal, themable Markdown notes app."
+long_description = """
+Noted is a lightweight Markdown notes app with retro themes
+(CandyCane, Win95, Dracula), live syntax highlighting, and a
+fast egui-based UI.
+"""
+copyright = "Copyright (c) 2026 Dan Bednarski"
+osx_minimum_system_version = "11.0"
