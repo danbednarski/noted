@@ -1155,8 +1155,36 @@ fn layout_inline(job: &mut LayoutJob, text: &str, base: &TextFormat) {
             }
         }
 
+        // underline __...__
+        if b == b'_' && i + 1 < bytes.len() && bytes[i + 1] == b'_' {
+            let prev_word = i > 0 && is_word(bytes[i - 1]);
+            if !prev_word {
+                if let Some(end) = find_close(text, i + 2, "__") {
+                    flush_plain(job, &text[plain_start..i], base);
+                    let stroke = Stroke::new(1.0, base.color);
+                    // Hide the literal `_` glyphs but keep their layout width so the
+                    // cursor stays aligned; the continuous underline stroke spans the
+                    // whole region, so the markers read as the underline itself.
+                    let mut marker = syntax_fmt(base.font_id.clone());
+                    marker.color = Color32::TRANSPARENT;
+                    marker.underline = stroke;
+                    job.append("__", 0.0, marker.clone());
+                    let mut und = base.clone();
+                    und.underline = stroke;
+                    layout_inline_styled(job, &text[i + 2..end], &und);
+                    job.append("__", 0.0, marker);
+                    i = end + 2;
+                    plain_start = i;
+                    continue;
+                }
+            }
+        }
+
         // italic _..._ (only if surrounded by non-word chars, simple check)
-        if b == b'_' {
+        if b == b'_'
+            && (i + 1 >= bytes.len() || bytes[i + 1] != b'_')
+            && (i == 0 || bytes[i - 1] != b'_')
+        {
             let prev_word = i > 0 && is_word(bytes[i - 1]);
             if !prev_word {
                 if let Some(end) = find_close_single(text, i + 1, b'_') {
