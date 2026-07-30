@@ -1,5 +1,8 @@
 use eframe::egui;
-use egui::{text::LayoutJob, Color32, FontFamily, FontId, Stroke, TextFormat};
+use egui::{
+    text::{LayoutJob, LayoutSection},
+    Color32, FontFamily, FontId, Stroke, TextFormat,
+};
 use muda::{CheckMenuItem, Menu, MenuEvent, MenuId, PredefinedMenuItem, Submenu};
 use std::cell::RefCell;
 use std::hash::{Hash, Hasher};
@@ -60,6 +63,8 @@ struct Pal {
     link: Color32,
     cursor: Color32,
     selection: Color32,
+    find: Color32,     // background of every search match
+    find_cur: Color32, // background of the active search match
 }
 
 fn pal() -> Pal {
@@ -77,6 +82,8 @@ fn pal() -> Pal {
             link: rgb(0x0a, 0x8a, 0x3a),
             cursor: rgb(0xc8, 0x10, 0x2e),
             selection: rgb(0xff, 0xd9, 0xde),
+            find: rgb(0xff, 0xee, 0xb0),
+            find_cur: rgb(0xff, 0xb3, 0x4d),
         },
         ThemeKind::Win95 => Pal {
             face: rgb(0xc0, 0xc0, 0xc0),
@@ -91,6 +98,8 @@ fn pal() -> Pal {
             link: rgb(0x00, 0x00, 0xff),
             cursor: rgb(0x00, 0x00, 0x00),
             selection: rgb(0xa6, 0xc0, 0xe0),
+            find: rgb(0xff, 0xff, 0x00),
+            find_cur: rgb(0xff, 0x99, 0x00),
         },
         // Dracula — https://draculatheme.com/contribute (official spec)
         ThemeKind::Dracula => Pal {
@@ -106,6 +115,8 @@ fn pal() -> Pal {
             link: rgb(0x8b, 0xe9, 0xfd),     // cyan
             cursor: rgb(0xff, 0x79, 0xc6),   // pink
             selection: rgb(0x44, 0x47, 0x5a),
+            find: rgb(0x55, 0x5c, 0x42),     // dim yellow wash
+            find_cur: rgb(0x8a, 0x92, 0x5e), // brighter yellow wash
         },
     }
 }
@@ -277,6 +288,26 @@ fn apply_style(ctx: &egui::Context) {
     style.visuals.text_cursor.stroke = Stroke::new(1.6, p.cursor);
     style.visuals.window_stroke = Stroke::NONE;
     style.spacing.item_spacing = egui::vec2(0.0, 6.0);
+
+    // Widgets (only used by the find bar) follow the palette instead of egui's
+    // stock dark theme.
+    let w = &mut style.visuals.widgets;
+    for v in [
+        &mut w.noninteractive,
+        &mut w.inactive,
+        &mut w.hovered,
+        &mut w.active,
+        &mut w.open,
+    ] {
+        v.bg_fill = p.face;
+        v.weak_bg_fill = p.face;
+        v.bg_stroke = Stroke::new(1.0, p.syntax);
+        v.fg_stroke = Stroke::new(1.0, p.text);
+        v.corner_radius = egui::CornerRadius::ZERO;
+        v.expansion = 0.0;
+    }
+    w.hovered.weak_bg_fill = p.code_bg;
+    w.active.weak_bg_fill = p.selection;
     ctx.set_style(style);
 }
 
@@ -288,6 +319,7 @@ struct NotedApp {
     last_saved: String,
     menu: AppMenu,
     last_pos: Option<(f32, f32)>,
+    find: Find,
 }
 
 impl NotedApp {
@@ -302,6 +334,7 @@ impl NotedApp {
             last_change: Instant::now(),
             menu,
             last_pos: None,
+            find: Find::default(),
         }
     }
 
@@ -351,6 +384,269 @@ impl NotedApp {
         if atomic_save(&self.path, &self.text).is_ok() {
             self.last_saved = self.text.clone();
             self.dirty = false;
+        }
+    }
+}
+
+// ---------- Find ----------
+
+fn edit_id() -> egui::Id {
+    egui::Id::new("note_editor")
+}
+
+fn find_id() -> egui::Id {
+    egui::Id::new("find_field")
+}
+
+#[derive(Default)]
+struct Find {
+    open: bool,
+    query: String,
+    /// Byte ranges of every match, in document order.
+    hits: Vec<(usize, usize)>,
+    current: usize,
+    /// The query/text the current `hits` were computed from.
+    indexed: Option<(String, u64)>,
+    focus_field: bool,
+    scroll_to_hit: bool,
+}
+
+impl Find {
+    fn step(&mut self, delta: isize) {
+        if self.hits.is_empty() {
+            return;
+        }
+        let n = self.hits.len() as isize;
+        self.current = (((self.current as isize + delta) % n + n) % n) as usize;
+        self.scroll_to_hit = true;
+    }
+
+    fn hit(&self) -> Option<(usize, usize)> {
+        if self.open {
+            self.hits.get(self.current).copied()
+        } else {
+            None
+        }
+    }
+}
+
+fn text_hash(text: &str) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut h);
+    h.finish()
+}
+
+/// All non-overlapping occurrences of `needle`, as byte ranges.
+///
+/// Smart case: a query typed in all-lowercase matches case-insensitively.
+/// Lowercasing is ASCII-only so byte offsets stay valid for the original text.
+fn find_hits(hay: &str, needle: &str) -> Vec<(usize, usize)> {
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let fold = !needle.chars().any(|c| c.is_uppercase());
+    let (hay, needle) = if fold {
+        (hay.to_ascii_lowercase(), needle.to_ascii_lowercase())
+    } else {
+        (hay.to_owned(), needle.to_owned())
+    };
+
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(p) = hay[from..].find(&needle) {
+        let s = from + p;
+        out.push((s, s + needle.len()));
+        from = s + needle.len();
+    }
+    out
+}
+
+impl NotedApp {
+    /// Shortcuts that work regardless of which field has focus. Runs before any
+    /// widget so the keys never reach the editor or the find field.
+    fn handle_find_keys(&mut self, ctx: &egui::Context) {
+        let cmd = egui::Modifiers::COMMAND;
+        let cmd_shift = egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT);
+
+        if ctx.input_mut(|i| i.consume_key(cmd, egui::Key::F)) {
+            // Seed the query from the editor selection, the way every other
+            // macOS app does.
+            if let Some((a, b)) = load_selection(ctx, edit_id()) {
+                if a != b {
+                    let sel = &self.text[char_idx_to_byte(&self.text, a)
+                        ..char_idx_to_byte(&self.text, b)];
+                    if !sel.contains('\n') && sel.chars().count() <= 128 {
+                        self.query_changed(sel.to_owned());
+                    }
+                }
+            }
+            self.find.open = true;
+            self.find.focus_field = true;
+        }
+
+        if !self.find.open {
+            return;
+        }
+
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+            self.close_find(ctx);
+            return;
+        }
+
+        let field_focused = ctx.memory(|m| m.has_focus(find_id()));
+        // Shift variants first: `consume_key` ignores extra modifiers.
+        let prev = ctx.input_mut(|i| {
+            i.consume_key(cmd_shift, egui::Key::G)
+                || (field_focused
+                    && i.consume_key(egui::Modifiers::SHIFT, egui::Key::Enter))
+        });
+        let next = ctx.input_mut(|i| {
+            i.consume_key(cmd, egui::Key::G)
+                || (field_focused
+                    && i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+        });
+        if prev {
+            self.find.step(-1);
+        } else if next {
+            self.find.step(1);
+        }
+    }
+
+    fn close_find(&mut self, ctx: &egui::Context) {
+        self.find.open = false;
+        // Leave the cursor on the match the user landed on.
+        if let Some((s, e)) = self.find.hits.get(self.find.current).copied() {
+            set_selection(
+                ctx,
+                edit_id(),
+                byte_to_char_idx(&self.text, s),
+                byte_to_char_idx(&self.text, e),
+            );
+        }
+        ctx.memory_mut(|m| m.request_focus(edit_id()));
+    }
+
+    fn query_changed(&mut self, q: String) {
+        self.find.query = q;
+        self.find.indexed = None;
+    }
+
+    /// Recomputes matches when the query or the document changed, and parks the
+    /// active match on the first hit at or after the cursor.
+    fn refresh_hits(&mut self, ctx: &egui::Context) {
+        if !self.find.open {
+            return;
+        }
+        let stamp = (self.find.query.clone(), text_hash(&self.text));
+        if self.find.indexed.as_ref() == Some(&stamp) {
+            return;
+        }
+        let fresh_query = self.find.indexed.as_ref().map(|(q, _)| q) != Some(&stamp.0);
+        self.find.indexed = Some(stamp);
+        self.find.hits = find_hits(&self.text, &self.find.query);
+
+        if self.find.hits.is_empty() {
+            self.find.current = 0;
+            return;
+        }
+        if fresh_query {
+            let from = load_selection(ctx, edit_id())
+                .map(|(a, _)| char_idx_to_byte(&self.text, a))
+                .unwrap_or(0);
+            self.find.current = self
+                .find
+                .hits
+                .iter()
+                .position(|&(s, _)| s >= from)
+                .unwrap_or(0);
+            self.find.scroll_to_hit = true;
+        } else {
+            self.find.current = self.find.current.min(self.find.hits.len() - 1);
+        }
+    }
+
+    fn draw_find_bar(&mut self, ctx: &egui::Context) {
+        if !self.find.open {
+            return;
+        }
+        let p = pal();
+        let win95 = theme_kind() == ThemeKind::Win95;
+        // Clear of the Win95 caption bar / the Mac fullsize content inset.
+        let top = if win95 { 28.0 } else { 12.0 };
+
+        let mut close = false;
+        let mut step = 0isize;
+        let area = egui::Area::new(egui::Id::new("find_bar"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-12.0, top))
+            .show(ctx, |ui| {
+                egui::Frame::NONE
+                    .fill(p.face)
+                    .inner_margin(egui::Margin::symmetric(8, 6))
+                    .stroke(if win95 {
+                        Stroke::NONE
+                    } else {
+                        Stroke::new(1.0, p.syntax)
+                    })
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
+                        ui.horizontal(|ui| {
+                            let mut q = self.find.query.clone();
+                            let field = ui.add(
+                                egui::TextEdit::singleline(&mut q)
+                                    .id(find_id())
+                                    .desired_width(150.0)
+                                    .font(FontId::new(15.0, FontFamily::Proportional))
+                                    .text_color(p.text)
+                                    .hint_text(
+                                        egui::RichText::new("find")
+                                            .color(p.syntax)
+                                            .size(15.0),
+                                    ),
+                            );
+                            if q != self.find.query {
+                                self.query_changed(q);
+                            }
+                            if self.find.focus_field {
+                                field.request_focus();
+                                self.find.focus_field = false;
+                            }
+
+                            let count = if self.find.query.is_empty() {
+                                String::new()
+                            } else if self.find.hits.is_empty() {
+                                "none".to_owned()
+                            } else {
+                                format!("{}/{}", self.find.current + 1, self.find.hits.len())
+                            };
+                            ui.label(
+                                egui::RichText::new(count).color(p.syntax).size(13.0),
+                            );
+
+                            if ui.button("‹").on_hover_text("Previous (⇧⏎)").clicked() {
+                                step = -1;
+                            }
+                            if ui.button("›").on_hover_text("Next (⏎)").clicked() {
+                                step = 1;
+                            }
+                            if ui.button("×").on_hover_text("Close (esc)").clicked() {
+                                close = true;
+                            }
+                        });
+                    });
+            });
+
+        if win95 {
+            raised(
+                &ctx.layer_painter(area.response.layer_id),
+                area.response.rect,
+            );
+        }
+        if step != 0 {
+            self.find.step(step);
+        }
+        if close {
+            self.close_find(ctx);
         }
     }
 }
@@ -438,6 +734,18 @@ impl eframe::App for NotedApp {
             self.last_pos = Some((r.min.x, r.min.y));
         }
 
+        // The find bar runs before the editor so a query typed this frame is
+        // already reflected in the highlighting the editor lays out below.
+        self.handle_find_keys(ctx);
+        self.draw_find_bar(ctx);
+        self.refresh_hits(ctx);
+        let hits = if self.find.open {
+            self.find.hits.clone()
+        } else {
+            Vec::new()
+        };
+        let hit = self.find.hit();
+
         let p = pal();
         let win95 = theme_kind() == ThemeKind::Win95;
         let frame = egui::Frame::NONE
@@ -466,11 +774,39 @@ impl eframe::App for NotedApp {
                             egui::vec2(column, ui.available_height()),
                             egui::Layout::top_down(egui::Align::LEFT),
                             |ui| {
-                                let edit_id = egui::Id::new("note_editor");
+                                let edit_id = edit_id();
 
                                 // Pre-intercept Tab / Shift+Tab so they don't move focus
                                 // or get swallowed by the TextEdit.
                                 let focused = ui.memory(|m| m.has_focus(edit_id));
+
+                                // Cmd/Ctrl + B / I / U wrap (or unwrap) the selection.
+                                if focused {
+                                    let mut marker = None;
+                                    ui.input_mut(|i| {
+                                        for (key, m) in [
+                                            (egui::Key::B, "**"),
+                                            (egui::Key::I, "*"),
+                                            (egui::Key::U, "__"),
+                                        ] {
+                                            if i.consume_key(egui::Modifiers::COMMAND, key)
+                                                || i.consume_key(egui::Modifiers::CTRL, key)
+                                            {
+                                                marker = Some(m);
+                                            }
+                                        }
+                                    });
+                                    if let Some(m) = marker {
+                                        if let Some(sel) = load_selection(ctx, edit_id) {
+                                            let (a, b) =
+                                                toggle_emphasis(&mut self.text, sel, m);
+                                            set_selection(ctx, edit_id, a, b);
+                                            self.dirty = true;
+                                            self.last_change = Instant::now();
+                                        }
+                                    }
+                                }
+
                                 if focused {
                                     let (do_tab, do_shift_tab) = ui.input_mut(|i| {
                                         let mut tab = false;
@@ -561,10 +897,10 @@ impl eframe::App for NotedApp {
 
                                 let prev_len = self.text.len();
 
-                                let (changed, cursor_range) = {
+                                let o = {
                                     let mut layouter =
                                         |ui: &egui::Ui, text: &str, wrap: f32| {
-                                            cached_galley(ui, text, wrap)
+                                            cached_galley(ui, text, wrap, &hits, hit)
                                         };
 
                                     let edit = egui::TextEdit::multiline(&mut self.text)
@@ -583,9 +919,34 @@ impl eframe::App for NotedApp {
                                         .lock_focus(true)
                                         .layouter(&mut layouter);
 
-                                    let o = edit.show(ui);
-                                    (o.response.changed(), o.cursor_range)
+                                    edit.show(ui)
                                 };
+                                let (changed, cursor_range) =
+                                    (o.response.changed(), o.cursor_range);
+
+                                // Bring the active search match into view. Done
+                                // from the galley so it works while the find
+                                // field, not the editor, holds focus.
+                                if self.find.scroll_to_hit {
+                                    self.find.scroll_to_hit = false;
+                                    if let Some((s, e)) = hit {
+                                        let a = o.galley.pos_from_ccursor(
+                                            egui::text::CCursor::new(byte_to_char_idx(
+                                                &self.text, s,
+                                            )),
+                                        );
+                                        let b = o.galley.pos_from_ccursor(
+                                            egui::text::CCursor::new(byte_to_char_idx(
+                                                &self.text, e,
+                                            )),
+                                        );
+                                        let r = a
+                                            .union(b)
+                                            .translate(o.galley_pos.to_vec2())
+                                            .expand(24.0);
+                                        ui.scroll_to_rect(r, None);
+                                    }
+                                }
 
                                 if changed {
                                     self.dirty = true;
@@ -897,6 +1258,66 @@ fn layout_markdown(text: &str, wrap_width: f32) -> LayoutJob {
         layout_line(&mut job, line);
     }
     job
+}
+
+/// Paints search-match backgrounds over a finished job.
+///
+/// `layout_markdown` appends every byte of the source exactly once and in
+/// order, so a job section's `byte_range` indexes the original text and match
+/// ranges can simply be sliced into the section list.
+fn paint_hits(job: &mut LayoutJob, hits: &[(usize, usize)], current: Option<(usize, usize)>) {
+    if hits.is_empty() {
+        return;
+    }
+    let p = pal();
+    let mut out: Vec<LayoutSection> = Vec::with_capacity(job.sections.len() + 2 * hits.len());
+
+    for sec in job.sections.drain(..) {
+        let (s, e) = (sec.byte_range.start, sec.byte_range.end);
+        if s >= e {
+            out.push(sec);
+            continue;
+        }
+        // Cut the section at every match boundary falling inside it. Matches can
+        // be one edit stale (the editor mutates the text before it lays it out),
+        // so offsets that no longer land on a char boundary are dropped rather
+        // than handed to the layouter.
+        let mut cuts = vec![s];
+        for &(hs, he) in hits {
+            if he <= s {
+                continue;
+            }
+            if hs >= e {
+                break;
+            }
+            if hs > s && job.text.is_char_boundary(hs) {
+                cuts.push(hs);
+            }
+            if he < e && job.text.is_char_boundary(he) {
+                cuts.push(he);
+            }
+        }
+        cuts.push(e);
+        cuts.dedup();
+
+        for w in cuts.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            let mut format = sec.format.clone();
+            if let Some(&h) = hits.iter().find(|&&(hs, he)| hs <= a && b <= he) {
+                format.background = if Some(h) == current {
+                    p.find_cur
+                } else {
+                    p.find
+                };
+            }
+            out.push(LayoutSection {
+                leading_space: if a == s { sec.leading_space } else { 0.0 },
+                byte_range: a..b,
+                format,
+            });
+        }
+    }
+    job.sections = out;
 }
 
 fn code_font() -> FontId {
@@ -1374,6 +1795,106 @@ fn load_cursor(ctx: &egui::Context, id: egui::Id) -> Option<usize> {
     Some(range.primary.index)
 }
 
+/// The selection as sorted char indices (equal if there is no selection).
+fn load_selection(ctx: &egui::Context, id: egui::Id) -> Option<(usize, usize)> {
+    let state = egui::TextEdit::load_state(ctx, id)?;
+    let [a, b] = state.cursor.char_range()?.sorted();
+    Some((a.index, b.index))
+}
+
+fn set_selection(ctx: &egui::Context, id: egui::Id, a: usize, b: usize) {
+    if let Some(mut state) = egui::TextEdit::load_state(ctx, id) {
+        let range = egui::text::CCursorRange::two(
+            egui::text::CCursor::new(a),
+            egui::text::CCursor::new(b),
+        );
+        state.cursor.set_char_range(Some(range));
+        state.store(ctx, id);
+    }
+}
+
+/// Tolerates a stale or mid-character offset by snapping down to the nearest
+/// char boundary.
+fn byte_to_char_idx(text: &str, byte: usize) -> usize {
+    let mut byte = byte.min(text.len());
+    while !text.is_char_boundary(byte) {
+        byte -= 1;
+    }
+    text[..byte].chars().count()
+}
+
+// ---------- Emphasis toggling (Cmd-B / Cmd-I / Cmd-U) ----------
+
+fn has_marker_at(text: &str, at: usize, marker: &str) -> bool {
+    text.as_bytes()
+        .get(at..at + marker.len())
+        .is_some_and(|s| s == marker.as_bytes())
+}
+
+/// Byte range of the alphanumeric word containing `byte`, empty if there is none.
+fn word_at(text: &str, byte: usize) -> (usize, usize) {
+    let mut start = byte;
+    for (i, c) in text[..byte].char_indices().rev() {
+        if !c.is_alphanumeric() {
+            break;
+        }
+        start = i;
+    }
+    let mut end = byte;
+    for (i, c) in text[byte..].char_indices() {
+        if !c.is_alphanumeric() {
+            break;
+        }
+        end = byte + i + c.len_utf8();
+    }
+    (start, end)
+}
+
+/// Wraps the selection in `marker`, or strips the markers if they are already
+/// there. With no selection it acts on the word under the cursor, and failing
+/// that inserts an empty pair with the cursor parked inside.
+///
+/// Takes and returns char indices (what egui's cursor speaks).
+fn toggle_emphasis(text: &mut String, sel: (usize, usize), marker: &str) -> (usize, usize) {
+    let m = marker.len(); // markers are ASCII, so bytes == chars
+    let mut bs = char_idx_to_byte(text, sel.0);
+    let mut be = char_idx_to_byte(text, sel.1);
+
+    if bs == be {
+        let (ws, we) = word_at(text, bs);
+        bs = ws;
+        be = we;
+    }
+
+    if bs == be {
+        text.insert_str(bs, &marker.repeat(2));
+        let c = byte_to_char_idx(text, bs + m);
+        return (c, c);
+    }
+
+    // Markers sit inside the selection: **like this**
+    if be - bs >= 2 * m && has_marker_at(text, bs, marker) && has_marker_at(text, be - m, marker)
+    {
+        text.replace_range(be - m..be, "");
+        text.replace_range(bs..bs + m, "");
+        return (byte_to_char_idx(text, bs), byte_to_char_idx(text, be - 2 * m));
+    }
+
+    // Markers sit just outside the selection: **like this**
+    if bs >= m && has_marker_at(text, bs - m, marker) && has_marker_at(text, be, marker) {
+        text.replace_range(be..be + m, "");
+        text.replace_range(bs - m..bs, "");
+        return (byte_to_char_idx(text, bs - m), byte_to_char_idx(text, be - m));
+    }
+
+    text.insert_str(be, marker);
+    text.insert_str(bs, marker);
+    (
+        byte_to_char_idx(text, bs + m),
+        byte_to_char_idx(text, be + m),
+    )
+}
+
 // ---------- Layout cache ----------
 
 struct CacheKey {
@@ -1381,6 +1902,7 @@ struct CacheKey {
     theme: u8,
     wrap: u32,
     ppp: u32,
+    find: u64,
 }
 
 thread_local! {
@@ -1388,12 +1910,22 @@ thread_local! {
         const { RefCell::new(None) };
 }
 
-fn cached_galley(ui: &egui::Ui, text: &str, wrap: f32) -> std::sync::Arc<egui::Galley> {
+fn cached_galley(
+    ui: &egui::Ui,
+    text: &str,
+    wrap: f32,
+    hits: &[(usize, usize)],
+    hit: Option<(usize, usize)>,
+) -> std::sync::Arc<egui::Galley> {
     let theme = ACTIVE_THEME.load(Ordering::Relaxed);
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     text.hash(&mut hasher);
+    let mut find_hasher = std::collections::hash_map::DefaultHasher::new();
+    hits.hash(&mut find_hasher);
+    hit.hash(&mut find_hasher);
     let key = CacheKey {
         hash: hasher.finish(),
+        find: find_hasher.finish(),
         theme,
         wrap: wrap.to_bits(),
         // pixels_per_point changes when the window moves to a monitor with a
@@ -1410,13 +1942,165 @@ fn cached_galley(ui: &egui::Ui, text: &str, wrap: f32) -> std::sync::Arc<egui::G
                     && k.theme == key.theme
                     && k.wrap == key.wrap
                     && k.ppp == key.ppp
+                    && k.find == key.find
             })
             .map(|(_, g)| g.clone())
     }) {
         return g;
     }
-    let job = layout_markdown(text, wrap);
+    let mut job = layout_markdown(text, wrap);
+    paint_hits(&mut job, hits, hit);
     let g = ui.fonts(|f| f.layout_job(job));
     LAYOUT_CACHE.with(|c| *c.borrow_mut() = Some((key, g.clone())));
     g
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DOC: &str = "\
+# Heading **bold**
+para with *italic*, __underline__, `code` and [a link](http://x.y)
+
+- list item
+  - nested
+1. ordered item
+
+> quoted _text_
+
+```rust
+fn main() { println!(\"hi\"); }
+```
+trailing";
+
+    /// `paint_hits` slices sections by byte offsets into the source, which is
+    /// only valid because the layout emits every source byte exactly once.
+    #[test]
+    fn layout_reproduces_the_source_verbatim() {
+        let job = layout_markdown(DOC, 400.0);
+        assert_eq!(job.text, DOC);
+        let mut next = 0;
+        for s in &job.sections {
+            assert_eq!(s.byte_range.start, next, "gap or overlap in sections");
+            next = s.byte_range.end;
+        }
+        assert_eq!(next, DOC.len());
+    }
+
+    #[test]
+    fn hits_get_a_background_and_sections_stay_contiguous() {
+        let hits = find_hits(DOC, "item");
+        assert_eq!(hits.len(), 2);
+        let mut job = layout_markdown(DOC, 400.0);
+        paint_hits(&mut job, &hits, Some(hits[1]));
+
+        let mut next = 0;
+        for s in &job.sections {
+            assert_eq!(s.byte_range.start, next);
+            next = s.byte_range.end;
+        }
+        assert_eq!(next, DOC.len());
+
+        let bg = |range: (usize, usize)| {
+            job.sections
+                .iter()
+                .filter(|s| s.byte_range.start >= range.0 && s.byte_range.end <= range.1)
+                .map(|s| s.format.background)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(bg(hits[0]), vec![pal().find]);
+        assert_eq!(bg(hits[1]), vec![pal().find_cur]);
+    }
+
+    /// Highlight ranges are computed from the text as it was *before* the
+    /// editor applied this frame's keystroke, so they can point mid-character.
+    /// The job must still be something epaint can lay out.
+    #[test]
+    fn stale_hits_survive_multi_byte_text() {
+        let text = "héllo wörld, héllo";
+        let stale = [(1, 3), (7, 9), (13, 18)]; // (1,3) and (7,9) start inside a char
+        let mut job = layout_markdown(text, 400.0);
+        paint_hits(&mut job, &stale, Some(stale[0]));
+        for s in &job.sections {
+            assert!(text.is_char_boundary(s.byte_range.start));
+            assert!(text.is_char_boundary(s.byte_range.end));
+        }
+
+        let mut defs = egui::FontDefinitions::default();
+        let fallback = defs.families[&FontFamily::Proportional].clone();
+        defs.families.insert(bold_family(), fallback.clone());
+        defs.families.insert(italic_family(), fallback);
+        let fonts = egui::epaint::text::Fonts::new(2.0, 4096, defs);
+        fonts.begin_pass(2.0, 4096);
+        assert_eq!(fonts.layout_job(job).text(), text);
+    }
+
+    #[test]
+    fn find_is_smart_case_and_non_overlapping() {
+        assert_eq!(find_hits("aXa xax", "xa"), vec![(1, 3), (4, 6)]);
+        assert_eq!(find_hits("aXa xax", "Xa"), vec![(1, 3)]);
+        assert_eq!(find_hits("aaaa", "aa"), vec![(0, 2), (2, 4)]);
+        assert!(find_hits("anything", "").is_empty());
+        // Byte offsets stay valid around multi-byte characters.
+        assert_eq!(find_hits("é far", "far"), vec![(3, 6)]);
+    }
+
+    fn toggled(text: &str, sel: (usize, usize), marker: &str) -> (String, (usize, usize)) {
+        let mut s = text.to_owned();
+        let range = toggle_emphasis(&mut s, sel, marker);
+        (s, range)
+    }
+
+    #[test]
+    fn emphasis_wraps_the_selection() {
+        assert_eq!(
+            toggled("one two three", (4, 7), "**"),
+            ("one **two** three".to_owned(), (6, 9))
+        );
+    }
+
+    #[test]
+    fn emphasis_unwraps_markers_inside_or_outside_the_selection() {
+        // selection covers the markers
+        assert_eq!(
+            toggled("one **two** three", (4, 11), "**"),
+            ("one two three".to_owned(), (4, 7))
+        );
+        // selection covers only the content
+        assert_eq!(
+            toggled("one **two** three", (6, 9), "**"),
+            ("one two three".to_owned(), (4, 7))
+        );
+        assert_eq!(
+            toggled("a __b__ c", (4, 5), "__"),
+            ("a b c".to_owned(), (2, 3))
+        );
+    }
+
+    #[test]
+    fn emphasis_falls_back_to_the_word_under_the_cursor() {
+        assert_eq!(
+            toggled("one two three", (5, 5), "*"),
+            ("one *two* three".to_owned(), (5, 8))
+        );
+        // No word under the cursor: empty pair, cursor parked inside.
+        assert_eq!(
+            toggled("one  two", (4, 4), "**"),
+            ("one **** two".to_owned(), (6, 6))
+        );
+    }
+
+    #[test]
+    fn emphasis_handles_multi_byte_text() {
+        // "héllo wörld", selecting "wörld" (chars 6..11)
+        let (text, sel) = toggled("héllo wörld", (6, 11), "**");
+        assert_eq!(text, "héllo **wörld**");
+        assert_eq!(sel, (8, 13));
+        // and back
+        assert_eq!(
+            toggled(&text, sel, "**").0,
+            "héllo wörld".to_owned()
+        );
+    }
 }
