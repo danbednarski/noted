@@ -388,6 +388,9 @@ impl NotedApp {
     }
 }
 
+#[cfg(target_os = "macos")]
+mod mac_ime;
+
 // ---------- Find ----------
 
 fn edit_id() -> egui::Id {
@@ -720,6 +723,27 @@ impl Config {
     }
 }
 
+impl NotedApp {
+    /// Bridges macOS's press-and-hold accent panel into the editor: applies the
+    /// accent it chose and drops the keystroke used to choose it, which AppKit
+    /// delivers to us anyway. See [`mac_ime`].
+    #[cfg(target_os = "macos")]
+    fn apply_accent_panel(&mut self, ctx: &egui::Context) {
+        mac_ime::install(ctx);
+        if let Some(caret) = mac_ime::take_replacement(&mut self.text) {
+            set_cursor(ctx, edit_id(), caret);
+            self.dirty = true;
+        }
+        if mac_ime::swallow_keys() {
+            ctx.input_mut(|i| {
+                i.events.retain(|e| {
+                    !matches!(e, egui::Event::Text(_) | egui::Event::Key { .. })
+                })
+            });
+        }
+    }
+}
+
 impl eframe::App for NotedApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         let [r, g, b, _] = pal().face.to_array();
@@ -728,6 +752,9 @@ impl eframe::App for NotedApp {
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_menu(ctx);
+
+        #[cfg(target_os = "macos")]
+        self.apply_accent_panel(ctx);
 
         // Remember window position for next launch.
         if let Some(r) = ctx.input(|i| i.viewport().outer_rect) {
@@ -981,6 +1008,15 @@ impl eframe::App for NotedApp {
                 });
             });
         });
+
+        #[cfg(target_os = "macos")]
+        {
+            let focused = ctx.memory(|m| m.has_focus(edit_id()));
+            let selection = load_selection(ctx, edit_id())
+                .filter(|_| focused)
+                .map(|(a, b)| (self.text.as_str(), a, b));
+            mac_ime::publish_selection(selection);
+        }
 
         if self.dirty {
             ctx.request_repaint_after(Duration::from_millis(550));
