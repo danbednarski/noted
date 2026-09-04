@@ -7,21 +7,24 @@
 //! panel never appears in an egui window. We do know the document, so we patch
 //! those two selectors on winit's view class and answer them from Noted's buffer.
 //!
-//! Everything here is a no-op unless the accent panel is involved: `insertText:`
-//! with no replacement range falls through to winit's own implementation, so
-//! ordinary typing and IME input are untouched.
+//! While the panel is open AppKit marks the base character, so that we replace it
+//! rather than append to it. winit drops the replacement range there too, which
+//! egui renders as a second copy of the character; [`panel_open`] reports that
+//! window so the caller can drop those marks.
+//!
+//! Everything here is a no-op unless the accent panel is involved: a call with no
+//! replacement range falls through to winit's own implementation, so ordinary
+//! typing and IME input are untouched.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use objc2::rc::Retained;
-use objc2::runtime::{AnyClass, Imp, Sel};
 use objc2::runtime::NSObjectProtocol;
-use objc2::sel;
-use objc2_app_kit::NSApplication;
+use objc2::runtime::{AnyClass, Imp, Sel};
+use objc2::{msg_send, sel};
 use objc2_foundation::{
-    MainThreadMarker, NSAttributedString, NSCopying, NSNotFound, NSObject, NSRange, NSString,
-    NSUInteger,
+    NSAttributedString, NSCopying, NSNotFound, NSObject, NSRange, NSString, NSUInteger,
 };
 
 struct State {
@@ -42,14 +45,17 @@ static STATE: Mutex<State> = Mutex::new(State {
 /// its own -- still lands in the note right away.
 static REPAINT: Mutex<Option<egui::Context>> = Mutex::new(None);
 
-/// Set while the panel-driven replacement is being applied, so the keystroke
-/// that chose the accent does not also land in the document.
-static SWALLOW_KEYS: AtomicBool = AtomicBool::new(false);
+/// Whether the accent panel is currently marking the character it would replace.
+static PANEL_OPEN: AtomicBool = AtomicBool::new(false);
 
 type SelectedRangeFn = unsafe extern "C" fn(&NSObject, Sel) -> NSRange;
 type InsertTextFn = unsafe extern "C" fn(&NSObject, Sel, &NSObject, NSRange);
+type SetMarkedTextFn = unsafe extern "C" fn(&NSObject, Sel, &NSObject, NSRange, NSRange);
+type UnmarkTextFn = unsafe extern "C" fn(&NSObject, Sel);
 
 static ORIG_INSERT_TEXT: OnceLock<InsertTextFn> = OnceLock::new();
+static ORIG_SET_MARKED_TEXT: OnceLock<SetMarkedTextFn> = OnceLock::new();
+static ORIG_UNMARK_TEXT: OnceLock<UnmarkTextFn> = OnceLock::new();
 
 unsafe extern "C" fn selected_range(_this: &NSObject, _sel: Sel) -> NSRange {
     match STATE.lock().unwrap().selection {
@@ -71,11 +77,38 @@ unsafe extern "C" fn insert_text(
         if let Some(ctx) = REPAINT.lock().unwrap().as_ref() {
             ctx.request_repaint();
         }
-        return;
+        // Clears winit's marked-text state. Without this its IME state machine
+        // stays in preedit and it stops forwarding keystrokes altogether.
+        unsafe { msg_send![this, unmarkText] }
     }
     // Not the accent panel: let winit handle it as before.
     if let Some(orig) = ORIG_INSERT_TEXT.get() {
         unsafe { orig(this, sel, string, range) };
+    }
+}
+
+/// The panel marks the character it is offering to replace. Everything else that
+/// marks text is a real input method, and is passed through untouched.
+unsafe extern "C" fn set_marked_text(
+    this: &NSObject,
+    sel: Sel,
+    string: &NSObject,
+    selected_range: NSRange,
+    replacement_range: NSRange,
+) {
+    if replacement_range.location != NSNotFound as NSUInteger {
+        PANEL_OPEN.store(!nsstring_of(string).is_empty(), Ordering::Relaxed);
+    }
+    if let Some(orig) = ORIG_SET_MARKED_TEXT.get() {
+        unsafe { orig(this, sel, string, selected_range, replacement_range) };
+    }
+}
+
+/// Dismissing the panel (escape, clicking away) unmarks rather than inserting.
+unsafe extern "C" fn unmark_text(this: &NSObject, sel: Sel) {
+    PANEL_OPEN.store(false, Ordering::Relaxed);
+    if let Some(orig) = ORIG_UNMARK_TEXT.get() {
+        unsafe { orig(this, sel) };
     }
 }
 
@@ -101,21 +134,33 @@ pub fn install(ctx: &egui::Context) {
     let Some(class) = AnyClass::get("WinitView") else {
         return; // Window not built yet.
     };
-    let (Some(range_method), Some(insert_method)) = (
+    let (Some(range_method), Some(insert_method), Some(mark_method), Some(unmark_method)) = (
         class.instance_method(sel!(selectedRange)),
         class.instance_method(sel!(insertText:replacementRange:)),
+        class.instance_method(sel!(setMarkedText:selectedRange:replacementRange:)),
+        class.instance_method(sel!(unmarkText)),
     ) else {
         return;
     };
 
     let range_imp: SelectedRangeFn = selected_range;
     let insert_imp: InsertTextFn = insert_text;
+    let mark_imp: SetMarkedTextFn = set_marked_text;
+    let unmark_imp: UnmarkTextFn = unmark_text;
     unsafe {
         range_method.set_implementation(std::mem::transmute::<SelectedRangeFn, Imp>(range_imp));
-        let prev = insert_method.set_implementation(std::mem::transmute::<InsertTextFn, Imp>(
-            insert_imp,
-        ));
+
+        let prev = insert_method
+            .set_implementation(std::mem::transmute::<InsertTextFn, Imp>(insert_imp));
         let _ = ORIG_INSERT_TEXT.set(std::mem::transmute::<Imp, InsertTextFn>(prev));
+
+        let prev = mark_method
+            .set_implementation(std::mem::transmute::<SetMarkedTextFn, Imp>(mark_imp));
+        let _ = ORIG_SET_MARKED_TEXT.set(std::mem::transmute::<Imp, SetMarkedTextFn>(prev));
+
+        let prev = unmark_method
+            .set_implementation(std::mem::transmute::<UnmarkTextFn, Imp>(unmark_imp));
+        let _ = ORIG_UNMARK_TEXT.set(std::mem::transmute::<Imp, UnmarkTextFn>(prev));
     }
     *REPAINT.lock().unwrap() = Some(ctx.clone());
     let _ = DONE.set(());
@@ -140,27 +185,12 @@ pub fn take_replacement(text: &mut String) -> Option<usize> {
     let start_byte = byte_offset(text, start);
     let end_byte = byte_offset(text, end);
     text.replace_range(start_byte..end_byte, &replacement);
-    SWALLOW_KEYS.store(true, Ordering::Relaxed);
     Some(start + replacement.chars().count())
 }
 
-/// True while the accent panel owns the keyboard. AppKit still delivers those
-/// keystrokes to the view, and winit forwards them to egui, so the digits and
-/// arrows used to pick an accent would otherwise be typed into the note.
-pub fn swallow_keys() -> bool {
-    if SWALLOW_KEYS.swap(false, Ordering::Relaxed) {
-        return true;
-    }
-    // The panel is a second window in our own process; we only ever open one.
-    let Some(mtm) = MainThreadMarker::new() else {
-        return false;
-    };
-    NSApplication::sharedApplication(mtm)
-        .windows()
-        .iter()
-        .filter(|window| window.isVisible())
-        .count()
-        > 1
+/// True while the panel is marking the character it would replace.
+pub fn panel_open() -> bool {
+    PANEL_OPEN.load(Ordering::Relaxed)
 }
 
 fn utf16_offset(text: &str, char_idx: usize) -> usize {
@@ -214,7 +244,6 @@ mod tests {
         let mut text = "hi".to_owned();
         assert_eq!(take_replacement(&mut text), Some(2));
         assert_eq!(text, "hí");
-        assert!(SWALLOW_KEYS.swap(false, Ordering::Relaxed));
 
         // Past a surrogate pair the byte and UTF-16 offsets disagree.
         STATE.lock().unwrap().pending = Some((3, 1, "é".to_owned()));

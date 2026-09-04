@@ -724,22 +724,20 @@ impl Config {
 }
 
 impl NotedApp {
-    /// Bridges macOS's press-and-hold accent panel into the editor: applies the
-    /// accent it chose and drops the keystroke used to choose it, which AppKit
-    /// delivers to us anyway. See [`mac_ime`].
+    /// Bridges macOS's press-and-hold accent panel into the editor. See [`mac_ime`].
     #[cfg(target_os = "macos")]
     fn apply_accent_panel(&mut self, ctx: &egui::Context) {
         mac_ime::install(ctx);
-        if let Some(caret) = mac_ime::take_replacement(&mut self.text) {
+        let replaced = mac_ime::take_replacement(&mut self.text);
+        if let Some(caret) = replaced {
             set_cursor(ctx, edit_id(), caret);
             self.dirty = true;
         }
-        if mac_ime::swallow_keys() {
-            ctx.input_mut(|i| {
-                i.events.retain(|e| {
-                    !matches!(e, egui::Event::Text(_) | egui::Event::Key { .. })
-                })
-            });
+        // The panel marks the character it is offering to replace, and the base
+        // character is already in the buffer. Letting that mark through would
+        // render it a second time next to the one we typed.
+        if replaced.is_some() || mac_ime::panel_open() {
+            ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Ime(_))));
         }
     }
 }
