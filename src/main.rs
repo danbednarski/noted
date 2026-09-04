@@ -1623,6 +1623,24 @@ fn layout_inline(job: &mut LayoutJob, text: &str, base: &TextFormat) {
             }
         }
 
+        // strikethrough ~~...~~ or ~...~
+        if b == b'~' {
+            let n = if i + 1 < bytes.len() && bytes[i + 1] == b'~' { 2 } else { 1 };
+            let marker = if n == 2 { "~~" } else { "~" };
+            if let Some(end) = find_close(text, i + n, marker) {
+                flush_plain(job, &text[plain_start..i], base);
+                let syn = syntax_fmt(base.font_id.clone());
+                job.append(marker, 0.0, syn.clone());
+                let mut st = base.clone();
+                st.strikethrough = Stroke::new(1.0, base.color);
+                layout_inline_styled(job, &text[i + n..end], &st);
+                job.append(marker, 0.0, syn);
+                i = end + n;
+                plain_start = i;
+                continue;
+            }
+        }
+
         // inline code `...`
         if b == b'`' {
             if let Some(end) = find_close_single(text, i + 1, b'`') {
@@ -1961,7 +1979,7 @@ mod tests {
 
     const DOC: &str = "\
 # Heading **bold**
-para with *italic*, __underline__, `code` and [a link](http://x.y)
+para with *italic*, __underline__, ~~struck~~, ~also~, `code` and [a link](http://x.y)
 
 - list item
   - nested
@@ -1986,6 +2004,22 @@ trailing";
             next = s.byte_range.end;
         }
         assert_eq!(next, DOC.len());
+    }
+
+    #[test]
+    fn tilde_runs_strike_through_their_contents() {
+        for (src, marker) in [("~~struck~~", "~~"), ("~also~", "~")] {
+            let job = layout_markdown(src, 400.0);
+            let inner = &src[marker.len()..src.len() - marker.len()];
+            let s = job
+                .sections
+                .iter()
+                .find(|s| &job.text[s.byte_range.clone()] == inner)
+                .expect("styled run missing");
+            assert!(s.format.strikethrough.width > 0.0, "no strike for {src}");
+        }
+        // Unmatched tilde stays literal.
+        assert_eq!(layout_markdown("a ~ b", 400.0).text, "a ~ b");
     }
 
     #[test]
