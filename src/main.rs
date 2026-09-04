@@ -733,11 +733,17 @@ impl NotedApp {
             set_cursor(ctx, edit_id(), caret);
             self.dirty = true;
         }
-        // The panel marks the character it is offering to replace, and the base
-        // character is already in the buffer. Letting that mark through would
-        // render it a second time next to the one we typed.
-        if replaced.is_some() || mac_ime::panel_open() {
-            ctx.input_mut(|i| i.events.retain(|e| !matches!(e, egui::Event::Ime(_))));
+        // Characters the panel took over: the repeats it suppressed while open,
+        // and the keystroke that picked an accent we have already applied.
+        let mut drop_text = mac_ime::text_events_to_drop();
+        if drop_text > 0 {
+            ctx.input_mut(|i| {
+                i.events.retain(|e| {
+                    let drop = drop_text > 0 && matches!(e, egui::Event::Text(_));
+                    drop_text -= usize::from(drop);
+                    !drop
+                })
+            });
         }
     }
 }
