@@ -50,9 +50,17 @@ pub fn parse_list_marker(line: &str) -> Option<(&str, &str)> {
     None
 }
 
+/// `"3. "` becomes `"4. "`; bullets are returned unchanged.
+fn next_marker(marker: &str) -> String {
+    marker
+        .strip_suffix(". ")
+        .and_then(|n| n.parse::<u64>().ok())
+        .map_or_else(|| marker.to_owned(), |n| format!("{}. ", n + 1))
+}
+
 /// Runs after the user typed a newline; the caret is at char `caret`, the
-/// start of the new line. Carries the previous line's list marker over, or
-/// ends the list when Enter is hit on an empty item.
+/// start of the new line. Carries the previous line's list marker over
+/// (numbering counts up), or ends the list when Enter is hit on an empty item.
 /// Returns the new caret if the text changed.
 pub fn continue_list(text: &mut String, caret: usize) -> Option<usize> {
     let at = char_idx_to_byte(text, caret);
@@ -68,7 +76,7 @@ pub fn continue_list(text: &mut String, caret: usize) -> Option<usize> {
         text.replace_range(prev_start..at, "");
         return Some(byte_to_char_idx(text, prev_start));
     }
-    let inject = format!("{indent}{marker}");
+    let inject = format!("{indent}{}", next_marker(marker));
     text.insert_str(at, &inject);
     Some(caret + inject.chars().count())
 }
@@ -199,6 +207,39 @@ mod tests {
         let mut s = text.to_owned();
         let r = f(&mut s);
         (s, r)
+    }
+
+    // ---- lists ----
+
+    #[test]
+    fn enter_continues_bullets_and_counts_ordered_lists_up() {
+        assert_eq!(
+            apply("* a\n", |t| continue_list(t, 4)),
+            ("* a\n* ".to_owned(), Some(6))
+        );
+        assert_eq!(
+            apply("Three things:\n1. Fitness\n", |t| continue_list(t, 25)),
+            ("Three things:\n1. Fitness\n2. ".to_owned(), Some(28))
+        );
+        assert_eq!(
+            apply("  9. x\n", |t| continue_list(t, 7)),
+            ("  9. x\n  10. ".to_owned(), Some(13))
+        );
+    }
+
+    #[test]
+    fn enter_on_an_empty_item_leaves_the_list() {
+        assert_eq!(
+            apply("1. a\n2. \n", |t| continue_list(t, 9)),
+            ("1. a\n".to_owned(), Some(5))
+        );
+    }
+
+    #[test]
+    fn enter_elsewhere_is_left_alone() {
+        assert_eq!(apply("plain\n", |t| continue_list(t, 6)).1, None);
+        assert_eq!(apply("* a", |t| continue_list(t, 3)).1, None); // no newline typed
+        assert_eq!(apply("héllo\n", |t| continue_list(t, 6)).1, None); // multi-byte
     }
 
     // ---- emphasis ----
