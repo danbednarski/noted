@@ -85,42 +85,75 @@ pub fn continue_list(text: &mut String, caret: usize) -> Option<usize> {
 
 const INDENT: &str = "  ";
 
-/// Tab / Shift+Tab at the caret (char index `sel.0`).
+/// Tab / Shift+Tab over the selection `(a, b)`, given as char indices.
 ///
-/// List lines are indented (or outdented) by two spaces; a caret on a non-list
-/// line inserts a literal tab. Returns the new caret, or `None` if nothing
+/// Every line the selection touches is indented (or outdented) by two spaces.
+/// A bare caret on a non-list line inserts a literal tab instead, so Tab still
+/// types a tab in prose. Returns the new selection, or `None` if nothing
 /// changed.
 pub fn shift_indent(
     text: &mut String,
     sel: (usize, usize),
     outdent: bool,
 ) -> Option<(usize, usize)> {
-    let bs = char_idx_to_byte(text, sel.0);
-    let start = line_start(text, bs);
-    let on_list = parse_list_marker(line_from(text, start)).is_some();
-
-    if outdent {
-        if !on_list {
-            return None;
-        }
-        let rm = text[start..]
-            .bytes()
-            .take(INDENT.len())
-            .take_while(|&b| b == b' ')
-            .count();
-        if rm == 0 {
-            return None;
-        }
-        text.replace_range(start..start + rm, "");
-        let c = byte_to_char_idx(text, bs.saturating_sub(rm).max(start));
-        Some((c, c))
-    } else if on_list {
-        text.insert_str(start, INDENT);
-        Some((sel.0 + 2, sel.0 + 2))
+    let (mut bs, mut be) = (char_idx_to_byte(text, sel.0), char_idx_to_byte(text, sel.1));
+    let first = line_start(text, bs);
+    // A selection ending right after a newline does not include the next line.
+    let last_end = if be > bs && text.as_bytes()[be - 1] == b'\n' {
+        be - 1
     } else {
+        be
+    };
+    let last = line_start(text, last_end);
+
+    if bs == be && !outdent && parse_list_marker(line_from(text, first)).is_none() {
         text.insert(bs, '\t');
-        Some((sel.0 + 1, sel.0 + 1))
+        return Some((sel.0 + 1, sel.0 + 1));
     }
+
+    let starts: Vec<usize> = std::iter::once(first)
+        .chain(
+            text[first..last]
+                .match_indices('\n')
+                .map(|(i, _)| first + i + 1),
+        )
+        .collect();
+
+    let mut changed = false;
+    // Walk backwards so earlier offsets stay valid while we splice.
+    for &start in starts.iter().rev() {
+        if outdent {
+            let rm = text[start..]
+                .bytes()
+                .take(INDENT.len())
+                .take_while(|&b| b == b' ')
+                .count();
+            if rm == 0 {
+                continue;
+            }
+            text.replace_range(start..start + rm, "");
+            // A caret inside the removed run lands on the line start.
+            let shrink = |p: usize| {
+                if p >= start + rm {
+                    p - rm
+                } else {
+                    p.min(start)
+                }
+            };
+            bs = shrink(bs);
+            be = shrink(be);
+        } else {
+            text.insert_str(start, INDENT);
+            if start <= bs {
+                bs += INDENT.len();
+            }
+            if start <= be {
+                be += INDENT.len();
+            }
+        }
+        changed = true;
+    }
+    changed.then(|| (byte_to_char_idx(text, bs), byte_to_char_idx(text, be)))
 }
 
 // ---------- Emphasis toggling (Cmd-B / Cmd-I / Cmd-U) ----------
@@ -240,6 +273,58 @@ mod tests {
         assert_eq!(apply("plain\n", |t| continue_list(t, 6)).1, None);
         assert_eq!(apply("* a", |t| continue_list(t, 3)).1, None); // no newline typed
         assert_eq!(apply("héllo\n", |t| continue_list(t, 6)).1, None); // multi-byte
+    }
+
+    // ---- indentation ----
+
+    #[test]
+    fn tab_indents_every_selected_line() {
+        let src = "* a\n* b\n* c\n* d";
+        // Select from inside "b" to inside "c".
+        assert_eq!(
+            apply(src, |t| shift_indent(t, (6, 10), false)),
+            ("* a\n  * b\n  * c\n* d".to_owned(), Some((8, 14)))
+        );
+        // Selection ending right after a newline leaves the next line alone.
+        assert_eq!(
+            apply(src, |t| shift_indent(t, (4, 8), false)).0,
+            "* a\n  * b\n* c\n* d"
+        );
+        // Works on prose too when there is a selection.
+        assert_eq!(
+            apply("x\ny", |t| shift_indent(t, (0, 3), false)).0,
+            "  x\n  y"
+        );
+    }
+
+    #[test]
+    fn shift_tab_outdents_every_selected_line_and_clamps_the_caret() {
+        assert_eq!(
+            apply("  * a\n * b\n* c", |t| shift_indent(t, (1, 13), true)),
+            ("* a\n* b\n* c".to_owned(), Some((0, 10)))
+        );
+        // Nothing to remove: no change reported.
+        assert_eq!(apply("* a", |t| shift_indent(t, (2, 2), true)).1, None);
+    }
+
+    #[test]
+    fn bare_caret_indents_list_lines_but_types_a_tab_in_prose() {
+        assert_eq!(
+            apply("* a", |t| shift_indent(t, (3, 3), false)),
+            ("  * a".to_owned(), Some((5, 5)))
+        );
+        assert_eq!(
+            apply("ab", |t| shift_indent(t, (1, 1), false)),
+            ("a\tb".to_owned(), Some((2, 2)))
+        );
+    }
+
+    #[test]
+    fn indent_keeps_char_indices_honest_around_multi_byte_text() {
+        assert_eq!(
+            apply("* é\n* ö", |t| shift_indent(t, (2, 7), false)),
+            ("  * é\n  * ö".to_owned(), Some((4, 11)))
+        );
     }
 
     // ---- emphasis ----
