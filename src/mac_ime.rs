@@ -78,8 +78,7 @@ unsafe extern "C" fn insert_text(this: &NSObject, sel: Sel, string: &NSObject, r
 
     if range.location != NSNotFound as NSUInteger {
         // An accent picked from the panel, replacing the character it opened on.
-        STATE.lock().unwrap().pending =
-            Some((range.location as usize, range.length as usize, text));
+        STATE.lock().unwrap().pending = Some((range.location, range.length, text));
         PANEL_REPLACED.store(true, Ordering::Relaxed);
         if let Some(ctx) = REPAINT.lock().unwrap().as_ref() {
             ctx.request_repaint();
