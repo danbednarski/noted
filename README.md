@@ -43,6 +43,15 @@ create-dmg \
   target/release/bundle/osx/Noted.app
 ```
 
+## Development
+
+```bash
+cargo test && cargo clippy --all-targets
+```
+
+Architecture, invariants and how-tos for contributors (human or agent) are in
+[CLAUDE.md](CLAUDE.md).
+
 ## License
 
 MIT
