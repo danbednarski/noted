@@ -119,19 +119,21 @@ impl NotedApp {
     fn handle_editor_keys(&mut self, ctx: &egui::Context) {
         let edit_id = edit_id();
 
-        // Cmd/Ctrl + B / I / U wrap (or unwrap) the selection.
+        // Cmd/Ctrl + B / I / U / Shift-H wrap (or unwrap) the selection.
+        // Highlight needs Shift because macOS owns Cmd-H (Hide).
         let marker = ctx.input_mut(|i| {
+            use egui::{Key, Modifiers as M};
             [
-                (egui::Key::B, "**"),
-                (egui::Key::I, "*"),
-                (egui::Key::U, "__"),
+                (M::NONE, Key::B, "**"),
+                (M::NONE, Key::I, "*"),
+                (M::NONE, Key::U, "__"),
+                (M::SHIFT, Key::H, "=="),
             ]
             .into_iter()
-            .find(|&(key, _)| {
-                i.consume_key(egui::Modifiers::COMMAND, key)
-                    || i.consume_key(egui::Modifiers::CTRL, key)
+            .find(|&(extra, key, _)| {
+                i.consume_key(M::COMMAND | extra, key) || i.consume_key(M::CTRL | extra, key)
             })
-            .map(|(_, m)| m)
+            .map(|(_, _, m)| m)
         });
         if let (Some(m), Some(sel)) = (marker, load_selection(ctx, edit_id)) {
             let (a, b) = edit::toggle_emphasis(&mut self.text, sel, m);

@@ -267,6 +267,15 @@ fn layout_inline(job: &mut LayoutJob, text: &str, base: &TextFormat) {
             }
         }
 
+        // highlight ==...== (opener must hug its text so `a == b` stays literal)
+        if b == b'=' && at(i + 1) == Some(b'=') && !matches!(at(i + 2), Some(b' ' | b'=') | None) {
+            if let Some(end) = find_close(text, i + 2, "==") {
+                let mut hl = base.clone();
+                hl.background = pal().highlight;
+                span!("==", &text[i + 2..end], "==", hl, end + 2);
+            }
+        }
+
         // inline code `...`
         if b == b'`' {
             if let Some(end) = find_close_single(text, i + 1, b'`') {
@@ -506,7 +515,7 @@ mod tests {
 
     const DOC: &str = "\
 # Heading **bold**
-para with *italic*, __underline__, ~~struck~~, ~also~, `code` and [a link](http://x.y)
+para with *italic*, __underline__, ~~struck~~, ~also~, ==marked==, `code` and [a link](http://x.y)
 
 - list item
   - nested
@@ -570,6 +579,27 @@ trailing";
         }
         // Unmatched tilde stays literal.
         assert_eq!(layout_markdown("a ~ b", 400.0).text, "a ~ b");
+    }
+
+    #[test]
+    fn equals_runs_highlight_their_contents() {
+        let job = layout_markdown("a ==marked== b", 400.0);
+        let s = job
+            .sections
+            .iter()
+            .find(|s| &job.text[s.byte_range.clone()] == "marked")
+            .expect("highlighted run missing");
+        assert_eq!(s.format.background, pal().highlight);
+        // Comparisons and rules stay literal.
+        for src in ["a == b and c == d", "===", "x =="] {
+            let job = layout_markdown(src, 400.0);
+            assert!(
+                job.sections
+                    .iter()
+                    .all(|s| s.format.background != pal().highlight),
+                "{src}"
+            );
+        }
     }
 
     #[test]

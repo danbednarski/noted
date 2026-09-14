@@ -52,8 +52,9 @@ pub struct Pal {
     pub link: Color32,
     pub cursor: Color32,
     pub selection: Color32,
-    pub find: Color32,     // background of every search match
-    pub find_cur: Color32, // background of the active search match
+    pub find: Color32,      // background of every search match
+    pub find_cur: Color32,  // background of the active search match
+    pub highlight: Color32, // ==marked== text; a different hue from `find` so search stays readable
 }
 
 pub fn pal() -> Pal {
@@ -73,6 +74,7 @@ pub fn pal() -> Pal {
             selection: rgb(0xff, 0xd9, 0xde),
             find: rgb(0xff, 0xee, 0xb0),
             find_cur: rgb(0xff, 0xb3, 0x4d),
+            highlight: rgb(0xd8, 0xf5, 0xd0),
         },
         ThemeKind::Win95 => Pal {
             face: rgb(0xc0, 0xc0, 0xc0),
@@ -89,6 +91,7 @@ pub fn pal() -> Pal {
             selection: rgb(0xa6, 0xc0, 0xe0),
             find: rgb(0xff, 0xff, 0x00),
             find_cur: rgb(0xff, 0x99, 0x00),
+            highlight: rgb(0x00, 0xff, 0xff),
         },
         // Dracula: https://draculatheme.com/contribute (official spec)
         ThemeKind::Dracula => Pal {
@@ -104,8 +107,9 @@ pub fn pal() -> Pal {
             link: rgb(0x8b, 0xe9, 0xfd),   // cyan
             cursor: rgb(0xff, 0x79, 0xc6), // pink
             selection: rgb(0x44, 0x47, 0x5a),
-            find: rgb(0x55, 0x5c, 0x42),     // dim yellow wash
-            find_cur: rgb(0x8a, 0x92, 0x5e), // brighter yellow wash
+            find: rgb(0x55, 0x5c, 0x42),      // dim yellow wash
+            find_cur: rgb(0x8a, 0x92, 0x5e),  // brighter yellow wash
+            highlight: rgb(0x2f, 0x5a, 0x45), // green wash
         },
     }
 }
