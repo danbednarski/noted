@@ -56,6 +56,12 @@ static SUPPRESS_TEXT: AtomicUsize = AtomicUsize::new(0);
 static APPKIT_INSERTED: AtomicBool = AtomicBool::new(false);
 static PANEL_REPLACED: AtomicBool = AtomicBool::new(false);
 
+/// Set once a held key opens the panel, cleared when it hands back an accent or
+/// AppKit inserts text normally again. A key that picks an accent by number is
+/// not guaranteed to deliver the replacement inside its own `keyDown:`, so
+/// `PANEL_REPLACED` alone lets the digit through.
+static PANEL_OPEN: AtomicBool = AtomicBool::new(false);
+
 type SelectedRangeFn = unsafe extern "C" fn(&NSObject, Sel) -> NSRange;
 type InsertTextFn = unsafe extern "C" fn(&NSObject, Sel, &NSObject, NSRange);
 type KeyDownFn = unsafe extern "C" fn(&NSObject, Sel, &NSEvent);
@@ -80,6 +86,7 @@ unsafe extern "C" fn insert_text(this: &NSObject, sel: Sel, string: &NSObject, r
         // An accent picked from the panel, replacing the character it opened on.
         STATE.lock().unwrap().pending = Some((range.location, range.length, text));
         PANEL_REPLACED.store(true, Ordering::Relaxed);
+        PANEL_OPEN.store(false, Ordering::Relaxed);
         if let Some(ctx) = REPAINT.lock().unwrap().as_ref() {
             ctx.request_repaint();
         }
@@ -112,13 +119,40 @@ unsafe extern "C" fn key_down(this: &NSObject, sel: Sel, event: &NSEvent) {
         unsafe { orig(this, sel, event) };
     }
 
-    // A repeat AppKit declined to insert is one the panel took over, and a key
-    // that picked an accent has already been applied as a replacement. Either
-    // way the character winit queued alongside it is not meant for the document.
-    let swallowed_repeat = repeat && types_text && !APPKIT_INSERTED.load(Ordering::Relaxed);
-    if editing && (swallowed_repeat || PANEL_REPLACED.load(Ordering::Relaxed)) {
+    let (suppress, open) = panel_takes_key(
+        editing,
+        repeat,
+        types_text,
+        APPKIT_INSERTED.load(Ordering::Relaxed),
+        PANEL_REPLACED.load(Ordering::Relaxed),
+        PANEL_OPEN.load(Ordering::Relaxed),
+    );
+    PANEL_OPEN.store(open, Ordering::Relaxed);
+    if suppress {
         SUPPRESS_TEXT.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// Whether the character winit queued for this keystroke belongs to the panel,
+/// and whether the panel is open afterwards. A repeat AppKit declined to insert
+/// is one the panel took over; while it is open, any typing key AppKit does not
+/// insert (the digit that picks an accent) is the panel's too; and a key whose
+/// accent already arrived as a replacement is spent.
+fn panel_takes_key(
+    editing: bool,
+    repeat: bool,
+    types_text: bool,
+    inserted: bool,
+    replaced: bool,
+    open: bool,
+) -> (bool, bool) {
+    if !editing || inserted {
+        return (false, false);
+    }
+    let swallowed_repeat = repeat && types_text;
+    let picked = open && types_text;
+    let suppress = swallowed_repeat || picked || replaced;
+    (suppress, (open || swallowed_repeat) && !replaced)
 }
 
 /// `insertText:` is documented to receive either an `NSString` or an
@@ -270,6 +304,41 @@ mod tests {
         let mut text = "a\u{1F600}e".to_owned();
         assert_eq!(take_replacement(&mut text), Some(3));
         assert_eq!(text, "a\u{1F600}é");
+    }
+
+    #[test]
+    fn digit_picking_an_accent_is_dropped_even_before_the_replacement_lands() {
+        // args: editing, repeat, types_text, inserted, replaced, open
+        // "o" pressed: AppKit inserts it.
+        assert_eq!(
+            panel_takes_key(true, false, true, true, false, false),
+            (false, false)
+        );
+        // Held: the repeat opens the panel.
+        assert_eq!(
+            panel_takes_key(true, true, true, false, false, false),
+            (true, true)
+        );
+        // "4" picks, replacement arrives after keyDown: still dropped.
+        assert_eq!(
+            panel_takes_key(true, false, true, false, false, true),
+            (true, true)
+        );
+        // Replacement inside keyDown: dropped and the panel is closed.
+        assert_eq!(
+            panel_takes_key(true, false, true, false, true, true),
+            (true, false)
+        );
+        // Typing resumes normally once AppKit inserts again.
+        assert_eq!(
+            panel_takes_key(true, false, true, true, false, true),
+            (false, false)
+        );
+        // Escape closes the panel but types nothing: nothing to drop.
+        assert_eq!(
+            panel_takes_key(true, false, false, false, false, true),
+            (false, true)
+        );
     }
 
     #[test]
