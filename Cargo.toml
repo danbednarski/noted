@@ -1,6 +1,6 @@
 [package]
 name = "noted"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "A minimal, themable Markdown notes app."
 authors = ["Dan Bednarski <dan.j.bednarski@gmail.com>"]
