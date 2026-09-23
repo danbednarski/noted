@@ -36,7 +36,10 @@ fn main() -> eframe::Result<()> {
         .with_title_shown(false)
         .with_titlebar_shown(false)
         .with_titlebar_buttons_shown(false)
-        .with_fullsize_content_view(true);
+        .with_fullsize_content_view(true)
+        // Without an icon eframe swaps in its own logo at runtime, replacing
+        // the bundle's in the Dock; an empty one tells it to leave that alone.
+        .with_icon(egui::IconData::default());
     if let Some((x, y)) = cfg.pos {
         viewport = viewport.with_position([x, y]);
     }
