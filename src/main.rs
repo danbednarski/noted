@@ -317,6 +317,8 @@ impl NotedApp {
             .layouter(&mut layouter)
             .show(ui);
 
+        autoscroll_drag(ui, &o.response);
+
         // Bring the active search match into view. Done from the galley so it
         // works while the find field, not the editor, holds focus.
         if self.find.scroll_to_hit {
@@ -348,4 +350,28 @@ impl NotedApp {
             }
         }
     }
+}
+
+/// Keeps a drag-selection scrolling while the pointer is past the top or bottom
+/// of the view. egui's `TextEdit` only scrolls to the caret after keyboard edits:
+/// it snapshots the selection after the pointer has already moved it, so a drag
+/// never counts as a change.
+fn autoscroll_drag(ui: &egui::Ui, response: &egui::Response) {
+    let (Some(pos), true) = (ui.ctx().pointer_interact_pos(), response.dragged()) else {
+        return;
+    };
+    let view = ui.clip_rect();
+    let past = if pos.y < view.top() {
+        view.top() - pos.y
+    } else if pos.y > view.bottom() {
+        view.bottom() - pos.y
+    } else {
+        return;
+    };
+    // Faster the further out the pointer is, but never stalled at the edge,
+    // since a window flush with the menu bar leaves little room above it.
+    let speed = 15.0 * (past + 8.0f32.copysign(past));
+    let dt = ui.input(|i| i.stable_dt).min(0.1);
+    ui.scroll_with_delta(egui::vec2(0.0, speed * dt));
+    ui.ctx().request_repaint();
 }
